@@ -5,6 +5,7 @@ Asynchronous background processing with progress tracking
 
 import os
 import sys
+import glob
 import shutil
 import tempfile
 import threading
@@ -36,8 +37,13 @@ ALLOWED_IMAGES = {'png', 'jpg', 'jpeg', 'gif', 'webp'}
 # In-memory job store  { job_id: { status, progress, total, message, result, ... } }
 jobs = {}
 
-# Auto-cleanup: remove finished jobs older than 1 hour
-JOB_TTL_SECONDS = 3600
+# Auto-cleanup: remove finished jobs older than 10 minutes
+JOB_TTL_SECONDS = 600
+
+# Max total temp disk usage before refusing new jobs (2 GB)
+# This only blocks NEW jobs when old ones haven't been cleaned up yet.
+# A single job (even 1000+ mailers) always starts from ~0 and won't hit this.
+MAX_TEMP_USAGE_BYTES = 2 * 1024 * 1024 * 1024
 
 
 def allowed_file(filename, allowed_extensions):
@@ -53,6 +59,35 @@ def cleanup_old_jobs():
         job = jobs.pop(jid, None)
         if job and job.get('job_dir'):
             shutil.rmtree(job['job_dir'], ignore_errors=True)
+
+
+def cleanup_orphaned_temp_dirs():
+    """Remove mailer_job_* temp dirs that aren't tracked in the jobs dict.
+    This handles orphans left behind after a server restart/redeploy."""
+    tracked_dirs = {j.get('job_dir') for j in jobs.values() if j.get('job_dir')}
+    temp_root = tempfile.gettempdir()
+    for d in glob.glob(os.path.join(temp_root, 'mailer_job_*')):
+        if os.path.isdir(d) and d not in tracked_dirs:
+            shutil.rmtree(d, ignore_errors=True)
+
+
+def get_temp_usage_bytes():
+    """Calculate total disk usage of all tracked job directories."""
+    total = 0
+    for j in jobs.values():
+        job_dir = j.get('job_dir')
+        if job_dir and os.path.isdir(job_dir):
+            for dirpath, dirnames, filenames in os.walk(job_dir):
+                for f in filenames:
+                    try:
+                        total += os.path.getsize(os.path.join(dirpath, f))
+                    except OSError:
+                        pass
+    return total
+
+
+# --- Startup cleanup: wipe orphaned temp dirs from previous deploys ---
+cleanup_orphaned_temp_dirs()
 
 
 def run_generation(job_id, job_dir, params):
@@ -192,6 +227,11 @@ def generate():
             shutil.rmtree(job_dir, ignore_errors=True)
             return jsonify({'error': 'Mapbox API token is required'}), 400
 
+        # ── Check disk usage cap ──
+        if get_temp_usage_bytes() >= MAX_TEMP_USAGE_BYTES:
+            shutil.rmtree(job_dir, ignore_errors=True)
+            return jsonify({'error': 'Server is busy — too many pending jobs. Please try again in a few minutes.'}), 503
+
         # ── Create job record ──
         jobs[job_id] = {
             'status': 'queued',
@@ -230,6 +270,9 @@ def generate():
 @app.route('/status/<job_id>')
 def job_status(job_id):
     """Poll endpoint — returns current progress of a background job"""
+    # Piggyback cleanup on frequent poll calls
+    cleanup_old_jobs()
+
     job = jobs.get(job_id)
     if not job:
         return jsonify({'error': 'Job not found'}), 404

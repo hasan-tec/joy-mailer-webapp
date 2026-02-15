@@ -143,7 +143,7 @@ HTML_TEMPLATE = """
             width: 100%;
             height: 0.75in;
             background: #f5f5f5;
-            border: 2px dashed #D4AF37;
+            border: none;
             border-radius: 6px;
             display: flex;
             align-items: center;
@@ -257,7 +257,7 @@ HTML_TEMPLATE = """
             width: 100%;
             flex: 1;
             background: #f5f5f5;
-            border: 2px dashed #D4AF37;
+            border: none;
             border-radius: 6px;
             display: flex;
             align-items: center;
